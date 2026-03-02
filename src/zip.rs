@@ -58,11 +58,11 @@ impl ZipEntry {
 }
 
 /// Maximum number of entries the [`ZipIndex`] can hold.
-pub const MAX_ENTRIES: usize = 256;
+pub const MAX_ENTRIES: usize = 512;
 
 /// In-memory index of a ZIP archive's central directory.
 ///
-/// Holds up to [`MAX_ENTRIES`] entries inline (~5 KB); entry names are
+/// Holds up to [`MAX_ENTRIES`] entries inline (~9 KB); entry names are
 /// stored in a single heap-allocated byte pool.
 pub struct ZipIndex {
     entries: [ZipEntry; MAX_ENTRIES],
@@ -132,6 +132,8 @@ impl ZipIndex {
 
         let mut pos = 0;
 
+        let mut total_in_cd: usize = 0;
+
         while pos + 46 <= cd.len() {
             if le_u32(cd, pos) != CD_SIG {
                 break;
@@ -151,6 +153,8 @@ impl ZipIndex {
             if entry_end > cd.len() {
                 return Err("zip: CD entry extends past buffer");
             }
+
+            total_in_cd += 1;
 
             let idx = self.count as usize;
             if idx < MAX_ENTRIES {
@@ -176,6 +180,15 @@ impl ZipIndex {
 
         if self.count == 0 {
             return Err("zip: no entries in CD");
+        }
+
+        if total_in_cd > MAX_ENTRIES {
+            log::warn!(
+                "zip: {} entries in archive, only {} indexed (MAX_ENTRIES={})",
+                total_in_cd,
+                self.count,
+                MAX_ENTRIES
+            );
         }
 
         Ok(())

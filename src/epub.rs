@@ -109,7 +109,7 @@ impl EpubSpine {
 // ── table of contents ───────────────────────────────────────────────
 
 /// Maximum number of entries in the table of contents.
-pub const MAX_TOC: usize = 128;
+pub const MAX_TOC: usize = 256;
 /// Maximum byte length of a single TOC entry title.
 pub const TOC_TITLE_CAP: usize = 48;
 
@@ -479,7 +479,7 @@ pub fn parse_toc(
 ) {
     match source {
         TocSource::Ncx(_) => parse_ncx_toc(data, toc_dir, spine, zip, toc),
-        TocSource::Nav(_) => parse_nav_toc(data, toc_dir, spine, zip, toc),
+        TocSource::Nav(nav_idx) => parse_nav_toc(data, toc_dir, nav_idx, spine, zip, toc),
     }
 }
 
@@ -545,7 +545,7 @@ pub fn parse_ncx_toc(
             let gt = toc_find_byte(ncx, pos, b'>').unwrap_or(ncx.len());
             let tag_bytes = &ncx[name_start..gt];
             if let Some(src) = xml::get_attr(tag_bytes, b"src") {
-                let sidx = href_to_spine_idx(src, ncx_dir, spine, zip);
+                let sidx = href_to_spine_idx(src, ncx_dir, None, spine, zip);
                 toc.push(&title_buf[..title_len], sidx);
             }
             pos = if gt < ncx.len() { gt + 1 } else { gt };
@@ -574,6 +574,7 @@ pub fn parse_ncx_toc(
 pub fn parse_nav_toc(
     nav: &[u8],
     nav_dir: &str,
+    nav_zip_idx: usize,
     spine: &EpubSpine,
     zip: &ZipIndex,
     toc: &mut EpubToc,
@@ -662,7 +663,7 @@ pub fn parse_nav_toc(
         }
 
         if let Some(href) = href {
-            let sidx = href_to_spine_idx(href, nav_dir, spine, zip);
+            let sidx = href_to_spine_idx(href, nav_dir, Some(nav_zip_idx), spine, zip);
             toc.push(&title_buf[..title_len], sidx);
         }
     }
@@ -749,12 +750,27 @@ fn find_nav_toc_region(data: &[u8]) -> Option<(usize, usize)> {
 
 // resolve TOC href to spine index; strip fragment, percent-decode, resolve relative path.
 // returns 0xFFFF if unresolvable.
-fn href_to_spine_idx(href: &[u8], base_dir: &str, spine: &EpubSpine, zip: &ZipIndex) -> u16 {
+fn href_to_spine_idx(
+    href: &[u8],
+    base_dir: &str,
+    self_zip_idx: Option<usize>,
+    spine: &EpubSpine,
+    zip: &ZipIndex,
+) -> u16 {
     let decoded = percent_decode(href);
     let href_str = core::str::from_utf8(&decoded).unwrap_or("");
     // strip fragment
     let href_no_frag = href_str.split('#').next().unwrap_or(href_str);
     if href_no_frag.is_empty() {
+        // fragment-only href (e.g. "#chapter1"): resolve against the
+        // document's own zip entry so it can map to a spine index.
+        if let Some(zi) = self_zip_idx {
+            for i in 0..spine.len() {
+                if spine.items[i] as usize == zi {
+                    return i as u16;
+                }
+            }
+        }
         return 0xFFFF;
     }
 
