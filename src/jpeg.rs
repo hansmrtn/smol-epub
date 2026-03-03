@@ -1063,8 +1063,8 @@ fn parse_sos(data: &[u8], pos: &mut usize, st: &mut JpegState) -> Result<(), &'s
             return Err("jpeg: SOS references unknown component");
         }
     }
-    st.scan_ss = data[*pos];
-    st.scan_se = data[*pos + 1];
+    st.scan_ss = data[*pos].min(63);
+    st.scan_se = data[*pos + 1].min(63);
     let ah_al = data[*pos + 2];
     st.scan_al = ah_al & 0x0F;
     *pos += 3;
@@ -1197,6 +1197,9 @@ fn skip_block<R: JpegRead>(
 ) -> Result<(), &'static str> {
     let dc_size = huff_decode(r, dc_ht)?;
     if dc_size > 0 {
+        if dc_size > 11 {
+            return Err("jpeg: DC size > 11");
+        }
         let bits = r.read_bits(dc_size)?;
         *dc_pred += extend(bits, dc_size);
     }

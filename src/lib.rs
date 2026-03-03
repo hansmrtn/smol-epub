@@ -90,6 +90,9 @@ pub mod jpeg;
 #[cfg(feature = "images")]
 pub mod png;
 
+#[cfg(feature = "async")]
+pub mod async_io;
+
 // ── shared types ────────────────────────────────────────────────────
 
 /// A decoded 1-bit monochrome image, packed MSB-first, row-major.

@@ -58,13 +58,13 @@ impl EpubMeta {
     }
 
     fn set_title(&mut self, s: &[u8]) {
-        let n = s.len().min(TITLE_CAP);
+        let n = truncate_utf8(s, TITLE_CAP);
         self.title[..n].copy_from_slice(&s[..n]);
         self.title_len = n as u8;
     }
 
     fn set_author(&mut self, s: &[u8]) {
-        let n = s.len().min(AUTHOR_CAP);
+        let n = truncate_utf8(s, AUTHOR_CAP);
         self.author[..n].copy_from_slice(&s[..n]);
         self.author_len = n as u8;
     }
@@ -984,6 +984,22 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Truncate a byte slice to at most `max` bytes without splitting a
+/// multi-byte UTF-8 character.  Assumes `s` is valid UTF-8.
+fn truncate_utf8(s: &[u8], max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut n = max;
+    // If the byte at position n is a continuation byte (10xxxxxx),
+    // we are in the middle of a multi-byte character — back off to
+    // the lead byte and exclude the entire split character.
+    while n > 0 && (s[n] & 0xC0) == 0x80 {
+        n -= 1;
+    }
+    n
 }
 
 /// Check if a filename looks like an EPUB (`.epub` or `.epu` for FAT 8.3 truncation).

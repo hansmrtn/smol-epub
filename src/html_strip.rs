@@ -44,7 +44,7 @@ pub const fn is_marker(b: u8) -> bool {
 const TAG_BUF_CAP: usize = 16;
 const ENTITY_BUF_CAP: usize = 12;
 const BANG_BUF_CAP: usize = 8;
-const PENDING_CAP: usize = 16;
+const PENDING_CAP: usize = 24;
 const DEFERRED_CAP: usize = 8;
 const IMG_SRC_CAP: usize = 128; // 3-byte marker header + up to 125 path bytes
 
@@ -53,7 +53,6 @@ const IMG_SRC_CAP: usize = 128; // 3-byte marker header + up to 125 path bytes
 #[repr(u8)]
 enum Phase {
     Text,
-    Utf8Cont,
     AfterLt,
     TagName,
     TagBody,
@@ -115,10 +114,6 @@ pub struct HtmlStripStream {
     trailing_nl: u8, // deferred newlines; flushed before next visible byte; capped at 2
     has_output: bool, // true once any visible char emitted; suppresses leading whitespace
 
-    // UTF-8 multi-byte accumulator (used in Utf8Cont phase)
-    utf8_acc: u32,
-    utf8_remaining: u8,
-
     // deferred open-style markers; open-tag markers (bold on, heading on, etc.)
     // appear AFTER paragraph-break newlines and BEFORE text.
     // close-tag markers go to `pending` immediately (before paragraph newlines).
@@ -159,8 +154,6 @@ impl HtmlStripStream {
             last_was_space: true,
             trailing_nl: 0,
             has_output: false,
-            utf8_acc: 0,
-            utf8_remaining: 0,
             deferred: [0u8; DEFERRED_CAP],
             deferred_len: 0,
             pending: [0u8; PENDING_CAP],
@@ -233,46 +226,11 @@ impl HtmlStripStream {
                         self.phase = Phase::Entity;
                     } else if is_html_ws(b) {
                         self.queue_ws();
-                    } else if b >= 0xC0 {
-                        // UTF-8 lead byte: start multi-byte accumulation
-                        if b < 0xE0 {
-                            self.utf8_acc = (b as u32) & 0x1F;
-                            self.utf8_remaining = 1;
-                        } else if b < 0xF0 {
-                            self.utf8_acc = (b as u32) & 0x0F;
-                            self.utf8_remaining = 2;
-                        } else {
-                            self.utf8_acc = (b as u32) & 0x07;
-                            self.utf8_remaining = 3;
-                        }
-                        self.phase = Phase::Utf8Cont;
-                    } else if b >= 0x80 {
-                        // stray continuation byte; skip silently
                     } else {
+                        // ASCII printable and UTF-8 bytes (lead + continuation)
+                        // pass through directly; multi-byte sequences are
+                        // preserved in the output as-is
                         self.queue_text(b);
-                    }
-                }
-
-                // UTF-8 continuation bytes; accumulate then map to ASCII
-                Phase::Utf8Cont => {
-                    if b & 0xC0 == 0x80 {
-                        self.utf8_acc = (self.utf8_acc << 6) | (b as u32 & 0x3F);
-                        self.utf8_remaining -= 1;
-                        if self.utf8_remaining == 0 {
-                            if let Some(ascii) = codepoint_to_byte(self.utf8_acc) {
-                                if is_html_ws(ascii) {
-                                    self.queue_ws();
-                                } else {
-                                    self.queue_text(ascii);
-                                }
-                            }
-                            self.phase = Phase::Text;
-                        }
-                    } else {
-                        // broken sequence; emit replacement and reprocess byte
-                        self.queue_text(b'?');
-                        self.phase = Phase::Text;
-                        advance = false;
                     }
                 }
 
@@ -444,16 +402,7 @@ impl HtmlStripStream {
                     if b == b';' {
                         let name = &self.entity_buf[..self.entity_len as usize];
                         match resolve_entity(name) {
-                            Some(b'\n') => {
-                                self.trailing_nl = self.trailing_nl.saturating_add(1).min(2);
-                                self.last_was_space = true;
-                            }
-                            Some(c) if is_html_ws(c) => {
-                                self.queue_ws();
-                            }
-                            Some(c) => {
-                                self.queue_text(c);
-                            }
+                            Some(cp) => self.queue_codepoint(cp),
                             None => {
                                 // unrecognised entity; emit literal '&'
                                 self.queue_text(b'&');
@@ -721,6 +670,30 @@ impl HtmlStripStream {
         self.push_pending(b' ');
     }
 
+    // queue a Unicode codepoint as UTF-8 bytes; handles whitespace codepoints
+    fn queue_codepoint(&mut self, cp: u32) {
+        if cp == 0 {
+            return;
+        }
+        // newline
+        if cp == 0x0A {
+            self.trailing_nl = self.trailing_nl.saturating_add(1).min(2);
+            self.last_was_space = true;
+            return;
+        }
+        // whitespace (ASCII ws + NBSP + other Unicode spaces)
+        if cp == 0x20 || cp == 0x09 || cp == 0x0D || cp == 0x0C || cp == 0xA0 {
+            self.queue_ws();
+            return;
+        }
+        // encode to UTF-8 and queue each byte
+        let mut tmp = [0u8; 4];
+        let n = encode_codepoint_utf8(cp, &mut tmp);
+        for i in 0..n {
+            self.queue_text(tmp[i]);
+        }
+    }
+
     // classify accumulated tag name; push close markers to pending, open to deferred
     fn classify_tag(&mut self) {
         // copy tag name to a local to avoid borrowing self.tag_buf
@@ -921,25 +894,29 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
             r += advance;
 
             match decoded {
-                DecodedInplace::Byte(b'\n') => {
-                    buf[w] = b'\n';
-                    w += 1;
-                    trailing_nl = trailing_nl.saturating_add(1);
-                    last_was_space = true;
-                }
-                DecodedInplace::Byte(c) if is_html_ws(c) => {
-                    if !last_was_space {
-                        buf[w] = b' ';
+                DecodedInplace::Codepoint(cp) => {
+                    if cp == 0x0A {
+                        buf[w] = b'\n';
                         w += 1;
+                        trailing_nl = trailing_nl.saturating_add(1);
                         last_was_space = true;
+                    } else if cp == 0x20 || cp == 0x09 || cp == 0x0D || cp == 0x0C || cp == 0xA0 {
+                        if !last_was_space {
+                            buf[w] = b' ';
+                            w += 1;
+                            last_was_space = true;
+                            trailing_nl = 0;
+                        }
+                    } else {
+                        let mut tmp = [0u8; 4];
+                        let n = encode_codepoint_utf8(cp, &mut tmp);
+                        for i in 0..n {
+                            buf[w] = tmp[i];
+                            w += 1;
+                        }
+                        last_was_space = false;
                         trailing_nl = 0;
                     }
-                }
-                DecodedInplace::Byte(c) => {
-                    buf[w] = c;
-                    w += 1;
-                    last_was_space = false;
-                    trailing_nl = 0;
                 }
 
                 DecodedInplace::None => {
@@ -960,27 +937,34 @@ pub fn strip_html_inplace(buf: &mut Vec<u8>) {
                 trailing_nl = 0;
             }
         } else if b >= 0xC0 {
-            // UTF-8 multi-byte sequence; decode and replace with ASCII approx
-            let (cp, seq_len) = decode_utf8_char(buf, r, len);
-            if let Some(ascii) = codepoint_to_byte(cp) {
-                if is_html_ws(ascii) {
-                    if !last_was_space {
-                        buf[w] = b' ';
-                        w += 1;
-                        last_was_space = true;
-                        trailing_nl = 0;
-                    }
-                } else {
-                    buf[w] = ascii;
+            // UTF-8 lead byte: check for NBSP (U+00A0 = 0xC2 0xA0),
+            // otherwise pass through the full sequence unchanged
+            let seq_len = utf8_seq_len(b);
+            let end = (r + seq_len).min(len);
+            if b == 0xC2 && r + 1 < len && buf[r + 1] == 0xA0 {
+                // non-breaking space -> regular space
+                if !last_was_space {
+                    buf[w] = b' ';
                     w += 1;
-                    last_was_space = false;
+                    last_was_space = true;
                     trailing_nl = 0;
                 }
+            } else {
+                for idx in r..end {
+                    buf[w] = buf[idx];
+                    w += 1;
+                }
+                last_was_space = false;
+                trailing_nl = 0;
             }
-            r += seq_len;
+            r = end;
             continue;
         } else if b >= 0x80 {
-            // stray continuation byte; skip
+            // UTF-8 continuation byte (possibly stray): pass through
+            buf[w] = b;
+            w += 1;
+            last_was_space = false;
+            trailing_nl = 0;
             r += 1;
             continue;
         } else {
@@ -1110,33 +1094,127 @@ fn find_close_tag(data: &[u8], name: &[u8]) -> Option<usize> {
     None
 }
 
-// resolve entity name to output byte; None for unrecognised
-fn resolve_entity(name: &[u8]) -> Option<u8> {
+// resolve entity name to Unicode codepoint; None for unrecognised
+fn resolve_entity(name: &[u8]) -> Option<u32> {
     match name {
-        b"amp" => Some(b'&'),
-        b"lt" => Some(b'<'),
-        b"gt" => Some(b'>'),
-        b"quot" => Some(b'"'),
-        b"apos" => Some(b'\''),
-        b"nbsp" => Some(b' '),
-        b"mdash" | b"emdash" => Some(b'-'),
-        b"ndash" | b"endash" => Some(b'-'),
-        b"lsquo" | b"rsquo" | b"sbquo" => Some(b'\''),
-        b"ldquo" | b"rdquo" | b"bdquo" => Some(b'"'),
-        b"hellip" => Some(b'.'),
-        b"copy" => Some(b'c'),
-        b"reg" => Some(b'R'),
-        b"trade" => Some(b'T'),
-        b"times" => Some(b'x'),
-        b"divide" => Some(b'/'),
-        b"deg" => Some(b'*'),
-        b"plusmn" => Some(b'+'),
-        b"frac12" | b"frac14" | b"frac34" => Some(b'/'),
+        b"amp" => Some(0x26),                 // &
+        b"lt" => Some(0x3C),                  // <
+        b"gt" => Some(0x3E),                  // >
+        b"quot" => Some(0x22),                // "
+        b"apos" => Some(0x27),                // '
+        b"nbsp" => Some(0xA0),                // non-breaking space
+        b"mdash" | b"emdash" => Some(0x2014), // —
+        b"ndash" | b"endash" => Some(0x2013), // –
+        b"lsquo" => Some(0x2018),             // '
+        b"rsquo" => Some(0x2019),             // '
+        b"sbquo" => Some(0x201A),             // ‚
+        b"ldquo" => Some(0x201C),             // "
+        b"rdquo" => Some(0x201D),             // "
+        b"bdquo" => Some(0x201E),             // „
+        b"hellip" => Some(0x2026),            // …
+        b"bull" | b"bullet" => Some(0x2022),  // •
+        b"copy" => Some(0xA9),                // ©
+        b"reg" => Some(0xAE),                 // ®
+        b"trade" => Some(0x2122),             // ™
+        b"times" => Some(0xD7),               // ×
+        b"divide" => Some(0xF7),              // ÷
+        b"deg" => Some(0xB0),                 // °
+        b"plusmn" => Some(0xB1),              // ±
+        b"frac14" => Some(0xBC),              // ¼
+        b"frac12" => Some(0xBD),              // ½
+        b"frac34" => Some(0xBE),              // ¾
+        b"laquo" => Some(0xAB),               // «
+        b"raquo" => Some(0xBB),               // »
+        b"iexcl" => Some(0xA1),               // ¡
+        b"iquest" => Some(0xBF),              // ¿
+        b"cent" => Some(0xA2),                // ¢
+        b"pound" => Some(0xA3),               // £
+        b"yen" => Some(0xA5),                 // ¥
+        b"euro" => Some(0x20AC),              // €
+        b"sect" => Some(0xA7),                // §
+        b"para" => Some(0xB6),                // ¶
+        b"middot" => Some(0xB7),              // ·
+        b"micro" => Some(0xB5),               // µ
+        b"szlig" => Some(0xDF),               // ß
+        // Latin uppercase accented
+        b"Agrave" => Some(0xC0),
+        b"Aacute" => Some(0xC1),
+        b"Acirc" => Some(0xC2),
+        b"Atilde" => Some(0xC3),
+        b"Auml" => Some(0xC4),
+        b"Aring" => Some(0xC5),
+        b"AElig" => Some(0xC6),
+        b"Ccedil" => Some(0xC7),
+        b"Egrave" => Some(0xC8),
+        b"Eacute" => Some(0xC9),
+        b"Ecirc" => Some(0xCA),
+        b"Euml" => Some(0xCB),
+        b"Igrave" => Some(0xCC),
+        b"Iacute" => Some(0xCD),
+        b"Icirc" => Some(0xCE),
+        b"Iuml" => Some(0xCF),
+        b"ETH" => Some(0xD0),
+        b"Ntilde" => Some(0xD1),
+        b"Ograve" => Some(0xD2),
+        b"Oacute" => Some(0xD3),
+        b"Ocirc" => Some(0xD4),
+        b"Otilde" => Some(0xD5),
+        b"Ouml" => Some(0xD6),
+        b"Oslash" => Some(0xD8),
+        b"Ugrave" => Some(0xD9),
+        b"Uacute" => Some(0xDA),
+        b"Ucirc" => Some(0xDB),
+        b"Uuml" => Some(0xDC),
+        b"Yacute" => Some(0xDD),
+        b"THORN" => Some(0xDE),
+        // Latin lowercase accented
+        b"agrave" => Some(0xE0),
+        b"aacute" => Some(0xE1),
+        b"acirc" => Some(0xE2),
+        b"atilde" => Some(0xE3),
+        b"auml" => Some(0xE4),
+        b"aring" => Some(0xE5),
+        b"aelig" => Some(0xE6),
+        b"ccedil" => Some(0xE7),
+        b"egrave" => Some(0xE8),
+        b"eacute" => Some(0xE9),
+        b"ecirc" => Some(0xEA),
+        b"euml" => Some(0xEB),
+        b"igrave" => Some(0xEC),
+        b"iacute" => Some(0xED),
+        b"icirc" => Some(0xEE),
+        b"iuml" => Some(0xEF),
+        b"eth" => Some(0xF0),
+        b"ntilde" => Some(0xF1),
+        b"ograve" => Some(0xF2),
+        b"oacute" => Some(0xF3),
+        b"ocirc" => Some(0xF4),
+        b"otilde" => Some(0xF5),
+        b"ouml" => Some(0xF6),
+        b"oslash" => Some(0xF8),
+        b"ugrave" => Some(0xF9),
+        b"uacute" => Some(0xFA),
+        b"ucirc" => Some(0xFB),
+        b"uuml" => Some(0xFC),
+        b"yacute" => Some(0xFD),
+        b"thorn" => Some(0xFE),
+        b"yuml" => Some(0xFF),
+        // numeric references
         _ => {
             if name.starts_with(b"#x") || name.starts_with(b"#X") {
-                codepoint_to_byte(parse_hex(&name[2..]))
+                let cp = parse_hex(&name[2..]);
+                if cp > 0 && cp <= 0x10FFFF {
+                    Some(cp)
+                } else {
+                    None
+                }
             } else if name.starts_with(b"#") {
-                codepoint_to_byte(parse_decimal(&name[1..]))
+                let cp = parse_decimal(&name[1..]);
+                if cp > 0 && cp <= 0x10FFFF {
+                    Some(cp)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1144,56 +1222,50 @@ fn resolve_entity(name: &[u8]) -> Option<u8> {
     }
 }
 
-fn codepoint_to_byte(cp: u32) -> Option<u8> {
-    match cp {
-        0 => None,
-        0x0001..=0x007F => Some(cp as u8),
-        0x00A0 => Some(b' '),           // nbsp
-        0x00AB | 0x00BB => Some(b'"'),  // « »
-        0x00AD => Some(b'-'),           // soft hyphen
-        0x00B7 => Some(b'.'),           // middle dot
-        0x00D7 => Some(b'x'),           // multiplication sign
-        0x00F7 => Some(b'/'),           // division sign
-        0x2010..=0x2015 => Some(b'-'),  // hyphens, dashes (figure dash, horiz bar)
-        0x2018..=0x201B => Some(b'\''), // single quotes (left, right, low-9, reversed-9)
-        0x201C..=0x201F => Some(b'"'),  // double quotes (left, right, low-9, reversed-9)
-        0x2022 => Some(b'*'),           // bullet
-        0x2026 => Some(b'.'),           // horizontal ellipsis
-        0x2032 => Some(b'\''),          // prime
-        0x2033 => Some(b'"'),           // double prime
-        0x2039 | 0x203A => Some(b'\''), // single guillemets
-        0x2212 => Some(b'-'),           // minus sign
-        _ => Some(b'?'),                // unmapped codepoint
+/// Encode a Unicode codepoint as UTF-8 into `out`.  Returns the number
+/// of bytes written (1–4), or 0 for codepoint 0 / out-of-range.
+fn encode_codepoint_utf8(cp: u32, out: &mut [u8; 4]) -> usize {
+    if cp == 0 || cp > 0x10FFFF {
+        return 0;
     }
-}
-
-/// Decode one UTF-8 character starting at `buf[pos]` (which must be a lead byte >= 0xC0).
-/// Returns `(codepoint, byte_length)`. On malformed input returns `(0xFFFD, 1)`.
-fn decode_utf8_char(buf: &[u8], pos: usize, len: usize) -> (u32, usize) {
-    let b0 = buf[pos];
-    let (mut cp, expected) = if b0 < 0xE0 {
-        ((b0 as u32) & 0x1F, 2)
-    } else if b0 < 0xF0 {
-        ((b0 as u32) & 0x0F, 3)
+    if cp < 0x80 {
+        out[0] = cp as u8;
+        1
+    } else if cp < 0x800 {
+        out[0] = (0xC0 | (cp >> 6)) as u8;
+        out[1] = (0x80 | (cp & 0x3F)) as u8;
+        2
+    } else if cp < 0x10000 {
+        out[0] = (0xE0 | (cp >> 12)) as u8;
+        out[1] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+        out[2] = (0x80 | (cp & 0x3F)) as u8;
+        3
     } else {
-        ((b0 as u32) & 0x07, 4)
-    };
-    if pos + expected > len {
-        return (0xFFFD, len - pos); // truncated sequence; consume remaining
+        out[0] = (0xF0 | (cp >> 18)) as u8;
+        out[1] = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+        out[2] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+        out[3] = (0x80 | (cp & 0x3F)) as u8;
+        4
     }
-    for i in 1..expected {
-        let cont = buf[pos + i];
-        if cont & 0xC0 != 0x80 {
-            return (0xFFFD, i); // broken: stop before bad byte
-        }
-        cp = (cp << 6) | (cont as u32 & 0x3F);
-    }
-    (cp, expected)
 }
 
-// in-place entity decoding; separate from resolve_entity
+/// Return the expected byte length of a UTF-8 sequence from its lead byte.
+#[inline]
+fn utf8_seq_len(lead: u8) -> usize {
+    if lead < 0xC0 {
+        1
+    } else if lead < 0xE0 {
+        2
+    } else if lead < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+// in-place entity decoding; delegates to resolve_entity for the entity table
 enum DecodedInplace {
-    Byte(u8),
+    Codepoint(u32),
     None,
 }
 
@@ -1211,45 +1283,12 @@ fn decode_entity_inplace(input: &[u8], pos: usize) -> (DecodedInplace, usize) {
     let entity = &remaining[..semi];
     let advance = 1 + semi + 1;
 
-    let decoded = match entity {
-        b"amp" => DecodedInplace::Byte(b'&'),
-        b"lt" => DecodedInplace::Byte(b'<'),
-        b"gt" => DecodedInplace::Byte(b'>'),
-        b"quot" => DecodedInplace::Byte(b'"'),
-        b"apos" => DecodedInplace::Byte(b'\''),
-        b"nbsp" => DecodedInplace::Byte(b' '),
-        b"mdash" | b"emdash" => DecodedInplace::Byte(b'-'),
-        b"ndash" | b"endash" => DecodedInplace::Byte(b'-'),
-        b"lsquo" | b"rsquo" | b"sbquo" => DecodedInplace::Byte(b'\''),
-        b"ldquo" | b"rdquo" | b"bdquo" => DecodedInplace::Byte(b'"'),
-        b"hellip" => DecodedInplace::Byte(b'.'),
-        b"copy" => DecodedInplace::Byte(b'c'),
-        b"reg" => DecodedInplace::Byte(b'R'),
-        b"trade" => DecodedInplace::Byte(b'T'),
-        b"times" => DecodedInplace::Byte(b'x'),
-        b"divide" => DecodedInplace::Byte(b'/'),
-        b"deg" => DecodedInplace::Byte(b'*'),
-        b"plusmn" => DecodedInplace::Byte(b'+'),
-        b"frac12" | b"frac14" | b"frac34" => DecodedInplace::Byte(b'/'),
-        _ => {
-            if entity.starts_with(b"#x") || entity.starts_with(b"#X") {
-                codepoint_to_decoded_inplace(parse_hex(&entity[2..]))
-            } else if entity.starts_with(b"#") {
-                codepoint_to_decoded_inplace(parse_decimal(&entity[1..]))
-            } else {
-                DecodedInplace::None
-            }
-        }
+    let decoded = match resolve_entity(entity) {
+        Some(cp) => DecodedInplace::Codepoint(cp),
+        None => DecodedInplace::None,
     };
 
     (decoded, advance)
-}
-
-fn codepoint_to_decoded_inplace(cp: u32) -> DecodedInplace {
-    match codepoint_to_byte(cp) {
-        Some(b) => DecodedInplace::Byte(b),
-        None => DecodedInplace::None,
-    }
 }
 
 fn parse_hex(bytes: &[u8]) -> u32 {

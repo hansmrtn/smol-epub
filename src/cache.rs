@@ -3,6 +3,10 @@
 //! No persistent heap; ≈ 51 KB temporary per chapter.
 //! Cache directory layout uses 8.3-safe names: `_XXXXXXX/` with
 //! `META.BIN` + `CHnnn.TXT` files.
+//!
+//! [`strip_html_buf`] provides an in-memory variant that strips
+//! already-decompressed XHTML, suitable for offloading to a
+//! background task when the caller has pre-extracted the ZIP entry.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -11,7 +15,7 @@ use crate::html_strip::HtmlStripStream;
 use crate::zip::{METHOD_DEFLATE, METHOD_STORED, ZipEntry, ZipIndex};
 
 const CACHE_MAGIC: u32 = 0x504C_5043; // "PLPC"
-const CACHE_VERSION: u8 = 1;
+const CACHE_VERSION: u8 = 2;
 const META_HEADER: usize = 16;
 
 /// Maximum number of chapters that can be tracked in a single cache.
@@ -30,6 +34,22 @@ pub fn fnv1a(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in data {
         h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Compute the FNV-1a hash of `data` with ASCII case folding.
+///
+/// Identical to [`fnv1a`] except each byte is lowercased before
+/// hashing, so `b"FOO.EPUB"` and `b"foo.epub"` produce the same
+/// result.  Used by the bookmark cache for case-insensitive filename
+/// matching on FAT filesystems.
+#[inline]
+pub fn fnv1a_icase(data: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in data {
+        h ^= b.to_ascii_lowercase() as u32;
         h = h.wrapping_mul(0x0100_0193);
     }
     h
@@ -99,8 +119,8 @@ pub fn encode_cache_meta(
 
     buf[0..4].copy_from_slice(&CACHE_MAGIC.to_le_bytes());
     buf[4] = CACHE_VERSION;
-    buf[5] = count as u8;
-    buf[6] = 0;
+    // count stored as u16 LE in bytes [5..7); supports up to 65535 chapters
+    buf[5..7].copy_from_slice(&(count as u16).to_le_bytes());
     buf[7] = 0;
     buf[8..12].copy_from_slice(&epub_size.to_le_bytes());
     buf[12..16].copy_from_slice(&name_hash.to_le_bytes());
@@ -134,7 +154,8 @@ pub fn parse_cache_meta(
         return Err("cache: bad magic");
     }
 
-    if data[4] != CACHE_VERSION {
+    let version = data[4];
+    if version != CACHE_VERSION && version != 1 {
         return Err("cache: version mismatch");
     }
 
@@ -148,7 +169,12 @@ pub fn parse_cache_meta(
         return Err("cache: epub hash changed");
     }
 
-    let count = data[5] as usize;
+    // v1 stored count as u8 in byte [5]; v2 stores as u16 LE in [5..7)
+    let count = if version >= 2 {
+        u16::from_le_bytes([data[5], data[6]]) as usize
+    } else {
+        data[5] as usize
+    };
     if count != expected_chapters {
         return Err("cache: chapter count mismatch");
     }
@@ -388,6 +414,57 @@ fn stream_deflate<E>(
     }
 
     Ok(total_written)
+}
+
+/// Strip HTML from an already-decompressed XHTML buffer, producing
+/// styled plain text with inline `[MARKER, tag]` codes — the same
+/// output format as [`stream_strip_entry`].
+///
+/// This is the in-memory counterpart of the streaming pipeline: the
+/// caller extracts the full ZIP entry first (via [`crate::zip::extract_entry`]),
+/// then hands the uncompressed bytes here for CPU-only processing.
+///
+/// Returns the stripped text as a new `Vec<u8>`, or an error if
+/// allocation fails.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let xhtml = smol_epub::zip::extract_entry(&entry, offset, read_fn)?;
+/// let text  = smol_epub::cache::strip_html_buf(&xhtml)?;
+/// // write `text` to the chapter cache file
+/// ```
+pub fn strip_html_buf(xhtml: &[u8]) -> Result<Vec<u8>, &'static str> {
+    // Worst case: output ≈ input size (pure text, no tags). Over-
+    // estimate slightly; the Vec will not reallocate beyond this.
+    let mut out = Vec::new();
+    out.try_reserve_exact(xhtml.len())
+        .map_err(|_| "cache: OOM for strip buffer")?;
+
+    let mut stripper = HtmlStripStream::new();
+    let mut tmp = [0u8; STRIP_BUF_SIZE];
+    let mut ip: usize = 0;
+
+    while ip < xhtml.len() {
+        let (consumed, written) = stripper.feed(&xhtml[ip..], &mut tmp);
+        if written > 0 {
+            out.extend_from_slice(&tmp[..written]);
+        }
+        if consumed == 0 && written == 0 {
+            // no progress — skip one byte to break deadlock
+            ip += 1;
+        } else {
+            ip += consumed;
+        }
+    }
+
+    // flush any trailing state (deferred newlines, etc.)
+    let trailing = stripper.finish(&mut tmp);
+    if trailing > 0 {
+        out.extend_from_slice(&tmp[..trailing]);
+    }
+
+    Ok(out)
 }
 
 // feed input through stripper; flush to output_fn when FLUSH_THRESHOLD reached
