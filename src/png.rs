@@ -12,7 +12,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::DecodedImage;
@@ -93,16 +92,36 @@ pub fn decode_png_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedImag
         .map_err(|_| "png: OOM for output bitmap")?;
     output.resize(out_stride * out_h, 0u8);
 
-    let mut prev_row = vec![0u8; scanline_bytes];
-    let mut curr_row = vec![0u8; scanline_bytes];
+    let mut prev_row = Vec::new();
+    prev_row
+        .try_reserve_exact(scanline_bytes)
+        .map_err(|_| "png: OOM for row buffer")?;
+    prev_row.resize(scanline_bytes, 0u8);
+    let mut curr_row = Vec::new();
+    curr_row
+        .try_reserve_exact(scanline_bytes)
+        .map_err(|_| "png: OOM for row buffer")?;
+    curr_row.resize(scanline_bytes, 0u8);
 
     // Floyd-Steinberg error buffers (+2 for left/right sentinels)
-    let mut err_cur = vec![0i16; out_w + 2];
-    let mut err_nxt = vec![0i16; out_w + 2];
+    let mut err_cur = Vec::new();
+    err_cur
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "png: OOM for dither")?;
+    err_cur.resize(out_w + 2, 0i16);
+    let mut err_nxt = Vec::new();
+    err_nxt
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "png: OOM for dither")?;
+    err_nxt.resize(out_w + 2, 0i16);
 
     // streaming scanline accumulator: 1 filter byte + scanline_bytes
     let row_total = 1 + scanline_bytes;
-    let mut row_buf = vec![0u8; row_total];
+    let mut row_buf = Vec::new();
+    row_buf
+        .try_reserve_exact(row_total)
+        .map_err(|_| "png: OOM for scanline buffer")?;
+    row_buf.resize(row_total, 0u8);
     let mut row_pos: usize = 0;
 
     // streaming decompressor (~11KB heap-allocated)
@@ -116,7 +135,10 @@ pub fn decode_png_fit(data: &[u8], max_w: u16, max_h: u16) -> Result<DecodedImag
         unsafe { Box::from_raw(decomp_ptr as *mut miniz_oxide::inflate::core::DecompressorOxide) };
 
     // 32KB circular dictionary for wrapping-mode inflate
-    let mut dict = vec![0u8; DICT_SIZE];
+    let mut dict = Vec::new();
+    dict.try_reserve_exact(DICT_SIZE)
+        .map_err(|_| "png: OOM for dictionary")?;
+    dict.resize(DICT_SIZE, 0u8);
 
     let mut in_pos: usize = 0;
     let mut dict_pos: usize = 0; // cumulative output pos
@@ -329,8 +351,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateSource<F> {
     }
 
     fn pump(&mut self) -> Result<(), &'static str> {
-        use miniz_oxide::inflate::TINFLStatus;
         use miniz_oxide::inflate::core::{decompress, inflate_flags};
+        use miniz_oxide::inflate::TINFLStatus;
 
         if self.done {
             return Ok(());
@@ -485,6 +507,57 @@ where
     decode_png_deflate_streaming(read_fn, data_offset, comp_size, max_w, max_h)
 }
 
+// ── dimension peek (no decode) ─────────────────────────────────────
+
+/// Read the dimensions of a PNG from an in-memory buffer without decoding.
+///
+/// Returns `(width, height)` in source pixels.  Zero allocations.
+pub fn peek_png_dimensions(data: &[u8]) -> Result<(u32, u32), &'static str> {
+    let header = parse_ihdr(data)?;
+    Ok((header.width, header.height))
+}
+
+/// Read the dimensions of a PNG from a **stored** (uncompressed) ZIP entry
+/// by reading 29 bytes via `read_fn`.
+///
+/// Returns `(width, height)` in source pixels.  Zero heap allocations —
+/// only 29 bytes of stack are needed (8-byte signature + 8-byte chunk
+/// header + 13-byte IHDR data).
+pub fn peek_png_dimensions_streaming<F>(
+    mut read_fn: F,
+    data_offset: u32,
+    _data_size: u32,
+) -> Result<(u32, u32), &'static str>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
+{
+    // PNG structure: 8-byte signature, then IHDR chunk:
+    //   4-byte length (must be 13) + 4-byte "IHDR" + 13-byte data + 4-byte CRC
+    // We need bytes 0..29 to extract width (bytes 16..20) and height (bytes 20..24).
+    let mut buf = [0u8; 29];
+    let n = read_fn(data_offset, &mut buf)?;
+    if n < 29 {
+        return Err("png: too few bytes for IHDR");
+    }
+    if buf[..8] != PNG_SIG {
+        return Err("png: invalid signature");
+    }
+    // chunk header at offset 8: length (4) + type (4)
+    let ihdr_len = be_u32(&buf, 8) as usize;
+    if ihdr_len < 13 || buf[12..16] != CHUNK_IHDR {
+        return Err("png: missing or invalid IHDR");
+    }
+    // IHDR data starts at offset 16
+    let width = be_u32(&buf, 16);
+    let height = be_u32(&buf, 20);
+    if width == 0 || height == 0 {
+        return Err("png: zero dimensions");
+    }
+    Ok((width, height))
+}
+
+// ── internal streaming decoder ─────────────────────────────────────
+
 /// Core streaming PNG decoder; generic over byte source.
 /// Reads chunks sequentially, feeds IDAT into zlib row-by-row;
 /// never holds the full PNG in RAM.
@@ -600,12 +673,32 @@ fn decode_png_from<R: ReadExact>(
         .map_err(|_| "png: OOM for output bitmap")?;
     output.resize(out_stride * out_h, 0u8);
 
-    let mut prev_row = vec![0u8; scanline_bytes];
-    let mut curr_row = vec![0u8; scanline_bytes];
-    let mut err_cur = vec![0i16; out_w + 2];
-    let mut err_nxt = vec![0i16; out_w + 2];
+    let mut prev_row = Vec::new();
+    prev_row
+        .try_reserve_exact(scanline_bytes)
+        .map_err(|_| "png: OOM for row buffer")?;
+    prev_row.resize(scanline_bytes, 0u8);
+    let mut curr_row = Vec::new();
+    curr_row
+        .try_reserve_exact(scanline_bytes)
+        .map_err(|_| "png: OOM for row buffer")?;
+    curr_row.resize(scanline_bytes, 0u8);
+    let mut err_cur = Vec::new();
+    err_cur
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "png: OOM for dither")?;
+    err_cur.resize(out_w + 2, 0i16);
+    let mut err_nxt = Vec::new();
+    err_nxt
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "png: OOM for dither")?;
+    err_nxt.resize(out_w + 2, 0i16);
     let row_total = 1 + scanline_bytes;
-    let mut row_buf = vec![0u8; row_total];
+    let mut row_buf = Vec::new();
+    row_buf
+        .try_reserve_exact(row_total)
+        .map_err(|_| "png: OOM for scanline buffer")?;
+    row_buf.resize(row_total, 0u8);
     let mut row_pos: usize = 0;
 
     // streaming zlib decompressor for IDAT data
@@ -616,7 +709,10 @@ fn decode_png_from<R: ReadExact>(
     }
     let mut decomp =
         unsafe { Box::from_raw(decomp_ptr as *mut miniz_oxide::inflate::core::DecompressorOxide) };
-    let mut dict = vec![0u8; DICT_SIZE];
+    let mut dict = Vec::new();
+    dict.try_reserve_exact(DICT_SIZE)
+        .map_err(|_| "png: OOM for dictionary")?;
+    dict.resize(DICT_SIZE, 0u8);
     let mut dict_pos: usize = 0;
     let mut src_y: usize = 0;
     let mut out_y: usize = 0;

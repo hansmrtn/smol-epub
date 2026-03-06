@@ -12,7 +12,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::DecodedImage;
@@ -289,8 +288,8 @@ impl<F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>> DeflateReader<F> {
 
     // decompress more data into the circular window
     fn pump(&mut self) -> Result<(), &'static str> {
-        use miniz_oxide::inflate::TINFLStatus;
         use miniz_oxide::inflate::core::{decompress, inflate_flags};
+        use miniz_oxide::inflate::TINFLStatus;
 
         if self.done {
             return Ok(());
@@ -660,7 +659,104 @@ where
     decode_jpeg_deflate_streaming(read_fn, data_offset, comp_size, uncomp_size, max_w, max_h)
 }
 
-// baseline decode core (generic over byte source)
+// ── dimension peek (no decode) ─────────────────────────────────────
+
+/// Read the dimensions of a JPEG from an in-memory buffer without decoding.
+///
+/// Scans markers until SOF0/SOF2 and returns `(width, height)` in source
+/// pixels.  No heap allocation — only a linear scan of the header bytes.
+pub fn peek_jpeg_dimensions(data: &[u8]) -> Result<(u16, u16), &'static str> {
+    scan_sof_dimensions(data)
+}
+
+/// Read the dimensions of a JPEG from a **stored** (uncompressed) ZIP entry
+/// by streaming reads via `read_fn`.
+///
+/// Reads up to 32 KB of header data (enough to skip past EXIF/APP segments
+/// and reach the SOF marker), then scans for SOF0/SOF2 to extract
+/// `(width, height)`.  The header buffer is heap-allocated but no decoder
+/// state (~4.5 KB) is created.
+pub fn peek_jpeg_dimensions_streaming<F>(
+    mut read_fn: F,
+    data_offset: u32,
+    data_size: u32,
+) -> Result<(u16, u16), &'static str>
+where
+    F: FnMut(u32, &mut [u8]) -> Result<usize, &'static str>,
+{
+    let hdr_size = HEADER_READ.min(data_size as usize);
+    let mut hdr = Vec::new();
+    hdr.try_reserve_exact(hdr_size)
+        .map_err(|_| "jpeg: OOM for header peek")?;
+    hdr.resize(hdr_size, 0);
+    let n = read_fn(data_offset, &mut hdr)?;
+    hdr.truncate(n);
+    scan_sof_dimensions(&hdr)
+}
+
+/// Lightweight SOF scanner: finds the first SOF0 (0xC0) or SOF2 (0xC2)
+/// marker and extracts (width, height) without building full decoder state.
+fn scan_sof_dimensions(data: &[u8]) -> Result<(u16, u16), &'static str> {
+    if data.len() < 2 || data[0] != 0xFF || data[1] != M_SOI {
+        return Err("jpeg: invalid signature");
+    }
+    let mut pos = 2usize;
+    let len = data.len();
+
+    loop {
+        // skip to next 0xFF
+        while pos < len && data[pos] != 0xFF {
+            pos += 1;
+        }
+        // skip padding 0xFF bytes
+        while pos < len && data[pos] == 0xFF {
+            pos += 1;
+        }
+        if pos >= len {
+            return Err("jpeg: truncated (no SOF found)");
+        }
+        let marker = data[pos];
+        pos += 1;
+
+        match marker {
+            0x00 | M_RST0..=M_RST7 => continue,
+            M_SOF0 | M_SOF2 => {
+                // SOF segment: 2-byte length, 1-byte precision, 2-byte height, 2-byte width
+                if pos + 2 + 5 > len {
+                    return Err("jpeg: SOF truncated");
+                }
+                // skip segment length
+                let p = pos + 2;
+                // data[p] = precision (must be 8)
+                let height = be_u16(data, p + 1);
+                let width = be_u16(data, p + 3);
+                if width == 0 || height == 0 {
+                    return Err("jpeg: zero dimensions");
+                }
+                return Ok((width, height));
+            }
+            // unsupported SOF variants
+            0xC1 | 0xC3 | 0xC5..=0xCB | 0xCD..=0xCF => {
+                return Err("jpeg: unsupported SOF variant");
+            }
+            M_SOS => return Err("jpeg: SOS before SOF"),
+            M_EOI => return Err("jpeg: EOI before SOF"),
+            _ => {
+                // skip unknown marker by its 2-byte length field
+                if pos + 2 > len {
+                    return Err("jpeg: truncated marker");
+                }
+                let seg = be_u16(data, pos) as usize;
+                if seg < 2 || pos + seg > len {
+                    return Err("jpeg: bad marker length");
+                }
+                pos += seg;
+            }
+        }
+    }
+}
+
+// ── baseline decode core (generic over byte source) ────────────────
 
 fn validate_tables(st: &JpegState) -> Result<(), &'static str> {
     for sci in 0..st.scan_num_comp as usize {
@@ -734,14 +830,26 @@ fn decode_baseline<R: JpegRead>(
 
     // allocate buffers
 
-    let mut y_row = vec![128u8; row_w * mcu_h];
+    let mut y_row = Vec::new();
+    y_row
+        .try_reserve_exact(row_w * mcu_h)
+        .map_err(|_| "jpeg: OOM for y_row")?;
+    y_row.resize(row_w * mcu_h, 128u8);
     let mut output = Vec::new();
     output
         .try_reserve_exact(out_stride * out_h)
         .map_err(|_| "jpeg: OOM for output")?;
     output.resize(out_stride * out_h, 0u8);
-    let mut err_cur = vec![0i16; out_w + 2];
-    let mut err_nxt = vec![0i16; out_w + 2];
+    let mut err_cur = Vec::new();
+    err_cur
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "jpeg: OOM for dither")?;
+    err_cur.resize(out_w + 2, 0i16);
+    let mut err_nxt = Vec::new();
+    err_nxt
+        .try_reserve_exact(out_w + 2)
+        .map_err(|_| "jpeg: OOM for dither")?;
+    err_nxt.resize(out_w + 2, 0i16);
 
     let mut dc_pred = [0i32; MAX_COMP];
     let mut block = [0i32; 64];

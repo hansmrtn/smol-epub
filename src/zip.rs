@@ -58,11 +58,11 @@ impl ZipEntry {
 }
 
 /// Maximum number of entries the [`ZipIndex`] can hold.
-pub const MAX_ENTRIES: usize = 512;
+pub const MAX_ENTRIES: usize = 256;
 
 /// In-memory index of a ZIP archive's central directory.
 ///
-/// Holds up to [`MAX_ENTRIES`] entries inline (~9 KB); entry names are
+/// Holds up to [`MAX_ENTRIES`] entries inline (~4.5 KB); entry names are
 /// stored in a single heap-allocated byte pool.
 pub struct ZipIndex {
     entries: [ZipEntry; MAX_ENTRIES],
@@ -318,10 +318,10 @@ fn extract_deflate<E, F>(
 where
     F: FnMut(u32, &mut [u8]) -> Result<usize, E>,
 {
-    use miniz_oxide::inflate::TINFLStatus;
-    use miniz_oxide::inflate::core::DecompressorOxide;
     use miniz_oxide::inflate::core::decompress;
     use miniz_oxide::inflate::core::inflate_flags;
+    use miniz_oxide::inflate::core::DecompressorOxide;
+    use miniz_oxide::inflate::TINFLStatus;
 
     let comp_size = entry.comp_size as usize;
     let uncomp_size = entry.uncomp_size as usize;

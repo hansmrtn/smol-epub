@@ -10,7 +10,7 @@ use crate::xml;
 use crate::zip::ZipIndex;
 
 /// Maximum byte length of an EPUB title.
-pub const TITLE_CAP: usize = 96;
+pub const TITLE_CAP: usize = 64;
 /// Maximum byte length of an EPUB author name.
 pub const AUTHOR_CAP: usize = 64;
 /// Maximum number of spine entries (reading-order items).

@@ -1,8 +1,10 @@
 //! EPUB chapter cache: streaming decompress + HTML strip pipeline.
 //!
 //! No persistent heap; ≈ 51 KB temporary per chapter.
-//! Cache directory layout uses 8.3-safe names: `_XXXXXXX/` with
-//! `META.BIN` + `CHnnn.TXT` files.
+//!
+//! v3 unified cache format: single file per book (`_XXXXXXX.BIN`)
+//! containing a fixed 128-byte header, chapter offset table,
+//! concatenated chapter text, image index, and image data.
 //!
 //! [`strip_html_buf`] provides an in-memory variant that strips
 //! already-decompressed XHTML, suitable for offloading to a
@@ -12,7 +14,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::html_strip::HtmlStripStream;
-use crate::zip::{METHOD_DEFLATE, METHOD_STORED, ZipEntry, ZipIndex};
+use crate::zip::{ZipEntry, ZipIndex, METHOD_DEFLATE, METHOD_STORED};
 
 const CACHE_MAGIC: u32 = 0x504C_5043; // "PLPC"
 const CACHE_VERSION: u8 = 2;
@@ -53,6 +55,282 @@ pub fn fnv1a_icase(data: &[u8]) -> u32 {
         h = h.wrapping_mul(0x0100_0193);
     }
     h
+}
+
+// -- v3 unified cache format --
+//
+// single file per book: _XXXXXXX.BIN under _PULP/
+//
+// layout:
+//   [0..128)     fixed header (see HEADER_SIZE)
+//   [128..128+N*8) chapter offset table (N = chapter_count)
+//   [...]        concatenated chapter text data
+//   [...]        image index: u16 count + 12 bytes per entry
+//   [...]        concatenated image data (4-byte w/h header + 1bpp pixels)
+
+#[allow(missing_docs)]
+pub const HEADER_SIZE: usize = 128;
+#[allow(missing_docs)]
+pub const CACHE_V3: u8 = 3;
+#[allow(missing_docs)]
+pub const TITLE_CAP: usize = 48;
+#[allow(missing_docs)]
+pub const NAME_CAP: usize = 13;
+
+// header flag bits
+#[allow(missing_docs)]
+pub const FLAG_CHAPTERS_COMPLETE: u8 = 1 << 0;
+#[allow(missing_docs)]
+pub const FLAG_IMAGES_COMPLETE: u8 = 1 << 1;
+
+// per-chapter table entry: offset(u32) + size(u32) = 8 bytes
+#[allow(missing_docs)]
+pub const CHAPTER_ENTRY_SIZE: usize = 8;
+// per-image index entry: path_hash(u32) + offset(u32) + size(u32) = 12 bytes
+#[allow(missing_docs)]
+pub const IMAGE_ENTRY_SIZE: usize = 12;
+// image data header: width(u16) + height(u16) = 4 bytes
+#[allow(missing_docs)]
+pub const IMAGE_DATA_HEADER: usize = 4;
+
+// parsed v3 header
+#[allow(missing_docs)]
+#[derive(Clone, Copy)]
+pub struct CacheHeader {
+    pub version: u8,
+    pub chapter_count: u16,
+    pub flags: u8,
+    pub epub_size: u32,
+    pub name_hash: u32,
+    pub title_len: u8,
+    pub title: [u8; TITLE_CAP],
+    pub name_len: u8,
+    pub name: [u8; NAME_CAP],
+}
+
+#[allow(missing_docs)]
+impl CacheHeader {
+    pub const fn empty() -> Self {
+        Self {
+            version: 0,
+            chapter_count: 0,
+            flags: 0,
+            epub_size: 0,
+            name_hash: 0,
+            title_len: 0,
+            title: [0u8; TITLE_CAP],
+            name_len: 0,
+            name: [0u8; NAME_CAP],
+        }
+    }
+
+    #[inline]
+    pub fn title_str(&self) -> &str {
+        core::str::from_utf8(&self.title[..self.title_len as usize]).unwrap_or("")
+    }
+
+    #[inline]
+    pub fn chapters_complete(&self) -> bool {
+        self.flags & FLAG_CHAPTERS_COMPLETE != 0
+    }
+
+    // byte offset where the chapter offset table starts
+    #[inline]
+    pub fn table_offset(&self) -> u32 {
+        HEADER_SIZE as u32
+    }
+
+    // byte offset where chapter data starts (after the offset table)
+    #[inline]
+    pub fn data_offset(&self) -> u32 {
+        HEADER_SIZE as u32 + self.chapter_count as u32 * CHAPTER_ENTRY_SIZE as u32
+    }
+}
+
+// encode v3 header into a 128-byte buffer
+#[allow(missing_docs)]
+pub fn encode_v3_header(h: &CacheHeader, buf: &mut [u8; HEADER_SIZE]) {
+    *buf = [0u8; HEADER_SIZE];
+    buf[0..4].copy_from_slice(&CACHE_MAGIC.to_le_bytes());
+    buf[4] = CACHE_V3;
+    buf[5..7].copy_from_slice(&h.chapter_count.to_le_bytes());
+    buf[7] = h.flags;
+    buf[8..12].copy_from_slice(&h.epub_size.to_le_bytes());
+    buf[12..16].copy_from_slice(&h.name_hash.to_le_bytes());
+    buf[16] = h.title_len;
+    let tlen = h.title_len as usize;
+    buf[17..17 + tlen].copy_from_slice(&h.title[..tlen]);
+    buf[65] = h.name_len;
+    let nlen = h.name_len as usize;
+    buf[66..66 + nlen].copy_from_slice(&h.name[..nlen]);
+}
+
+// parse v3 header from a 128-byte buffer
+#[allow(missing_docs)]
+pub fn parse_v3_header(buf: &[u8; HEADER_SIZE]) -> Result<CacheHeader, &'static str> {
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != CACHE_MAGIC {
+        return Err("cache: bad magic");
+    }
+    let version = buf[4];
+    if version != CACHE_V3 {
+        return Err("cache: version mismatch (expected v3)");
+    }
+    let chapter_count = u16::from_le_bytes([buf[5], buf[6]]);
+    let flags = buf[7];
+    let epub_size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let name_hash = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let title_len = buf[16].min(TITLE_CAP as u8);
+    let mut title = [0u8; TITLE_CAP];
+    title[..title_len as usize].copy_from_slice(&buf[17..17 + title_len as usize]);
+    let name_len = buf[65].min(NAME_CAP as u8);
+    let mut name = [0u8; NAME_CAP];
+    name[..name_len as usize].copy_from_slice(&buf[66..66 + name_len as usize]);
+
+    Ok(CacheHeader {
+        version,
+        chapter_count,
+        flags,
+        epub_size,
+        name_hash,
+        title_len,
+        title,
+        name_len,
+        name,
+    })
+}
+
+// validate a parsed header against the current epub
+#[allow(missing_docs)]
+pub fn validate_v3_header(
+    h: &CacheHeader,
+    epub_size: u32,
+    name_hash: u32,
+    expected_chapters: usize,
+) -> Result<(), &'static str> {
+    if h.epub_size != epub_size {
+        return Err("cache: epub size changed");
+    }
+    if h.name_hash != name_hash {
+        return Err("cache: epub hash changed");
+    }
+    if h.chapter_count as usize != expected_chapters {
+        return Err("cache: chapter count mismatch");
+    }
+    Ok(())
+}
+
+// encode chapter offset table: [(offset, size); count]
+#[allow(missing_docs)]
+pub fn encode_chapter_table(entries: &[(u32, u32)], buf: &mut [u8]) {
+    for (i, &(offset, size)) in entries.iter().enumerate() {
+        let base = i * CHAPTER_ENTRY_SIZE;
+        buf[base..base + 4].copy_from_slice(&offset.to_le_bytes());
+        buf[base + 4..base + 8].copy_from_slice(&size.to_le_bytes());
+    }
+}
+
+// parse chapter offset table from buffer
+#[allow(missing_docs)]
+pub fn parse_chapter_table(
+    buf: &[u8],
+    count: usize,
+    out: &mut [(u32, u32)],
+) -> Result<(), &'static str> {
+    let needed = count * CHAPTER_ENTRY_SIZE;
+    if buf.len() < needed {
+        return Err("cache: chapter table truncated");
+    }
+    for i in 0..count {
+        let base = i * CHAPTER_ENTRY_SIZE;
+        let offset = u32::from_le_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]);
+        let size = u32::from_le_bytes([buf[base + 4], buf[base + 5], buf[base + 6], buf[base + 7]]);
+        out[i] = (offset, size);
+    }
+    Ok(())
+}
+
+// image index entry
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Default)]
+pub struct ImageIndexEntry {
+    pub path_hash: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+// encode image index: u16 count + entries
+#[allow(missing_docs)]
+pub fn encode_image_index(entries: &[ImageIndexEntry], buf: &mut [u8]) -> usize {
+    let count = entries.len() as u16;
+    buf[0..2].copy_from_slice(&count.to_le_bytes());
+    let mut pos = 2;
+    for e in entries {
+        buf[pos..pos + 4].copy_from_slice(&e.path_hash.to_le_bytes());
+        buf[pos + 4..pos + 8].copy_from_slice(&e.offset.to_le_bytes());
+        buf[pos + 8..pos + 12].copy_from_slice(&e.size.to_le_bytes());
+        pos += IMAGE_ENTRY_SIZE;
+    }
+    pos
+}
+
+// parse image index, returns count
+#[allow(missing_docs)]
+pub fn parse_image_index(buf: &[u8], out: &mut [ImageIndexEntry]) -> Result<usize, &'static str> {
+    if buf.len() < 2 {
+        return Err("cache: image index too short");
+    }
+    let count = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    let needed = 2 + count * IMAGE_ENTRY_SIZE;
+    if buf.len() < needed || count > out.len() {
+        return Err("cache: image index truncated or too large");
+    }
+    for i in 0..count {
+        let base = 2 + i * IMAGE_ENTRY_SIZE;
+        out[i] = ImageIndexEntry {
+            path_hash: u32::from_le_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]),
+            offset: u32::from_le_bytes([
+                buf[base + 4],
+                buf[base + 5],
+                buf[base + 6],
+                buf[base + 7],
+            ]),
+            size: u32::from_le_bytes([
+                buf[base + 8],
+                buf[base + 9],
+                buf[base + 10],
+                buf[base + 11],
+            ]),
+        };
+    }
+    Ok(count)
+}
+
+// generate 8.3 cache filename from hash: _XXXXXXX.BIN
+#[allow(missing_docs)]
+pub fn cache_filename(name_hash: u32) -> [u8; 12] {
+    let h = name_hash & 0x0FFF_FFFF;
+    let mut buf = [0u8; 12];
+    buf[0] = b'_';
+    for i in 0..7 {
+        let nibble = ((h >> (24 - i * 4)) & 0xF) as u8;
+        buf[1 + i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + nibble - 10
+        };
+    }
+    buf[8] = b'.';
+    buf[9] = b'B';
+    buf[10] = b'I';
+    buf[11] = b'N';
+    buf
+}
+
+#[allow(missing_docs)]
+#[inline]
+pub fn cache_filename_str(buf: &[u8; 12]) -> &str {
+    core::str::from_utf8(buf).unwrap_or("_0000000.BIN")
 }
 
 /// Generate an 8.3-safe cache directory name from a hash.
@@ -281,8 +559,8 @@ fn stream_deflate<E>(
     read_fn: &mut impl FnMut(u32, &mut [u8]) -> Result<usize, E>,
     output_fn: &mut impl FnMut(&[u8]) -> Result<(), &'static str>,
 ) -> Result<u32, &'static str> {
+    use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
     use miniz_oxide::inflate::TINFLStatus;
-    use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 
     let comp_size = entry.comp_size as usize;
     let uncomp_size = entry.uncomp_size;
